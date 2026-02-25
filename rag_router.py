@@ -1,42 +1,34 @@
 """
 FastAPI Router for RAG API
 
-All endpoints for document processing, indexing, and retrieval.
+Uses refactored services with centralized models.py and opensearch_client.py
 """
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException
 from typing import Optional
-import boto3
 
 from models.schemas import (
-    # Document Processing
     DocumentMetadataInput,
     ProcessDocumentsRequest,
     ProcessDocumentsResponse,
-    
-    # Indexing
     IndexCreateResponse,
     IndexStatsResponse,
     ChunkAndIndexRequest,
     ChunkAndIndexResponse,
-    
-    # Search & Query
     SearchRequest,
     SearchResponse,
     SearchResult,
     QueryRequest,
     QueryResponse,
     SourceDocument,
-    
-    # Sessions
     SessionCreateRequest,
     SessionCreateResponse,
     SessionQueryRequest,
-    
-    # Health
     HealthResponse
 )
 
+from services.models import ModelFactory
+from services.opensearch_client import OpenSearchClient
 from services.document_processor import DocumentProcessor
 from services.chunking_service import ChunkingPipeline
 from services.retrieval_service import RetrievalService
@@ -47,23 +39,37 @@ router = APIRouter(prefix="/api/v1", tags=["RAG"])
 
 
 # =============================================================================
-# SINGLETON INSTANCES (to persist sessions)
+# SINGLETON INSTANCES
 # =============================================================================
 
-_sagemaker_client: boto3.client = None
+_model_factory: ModelFactory = None
+_opensearch_client: OpenSearchClient = None
 _retrieval_service: RetrievalService = None
 
 
-def get_sagemaker_client() -> boto3.client:
-    """Get or create SageMaker runtime client"""
-    global _sagemaker_client
-    if _sagemaker_client is None:
-        _sagemaker_client = boto3.client('sagemaker-runtime', region_name=settings.aws_region)
-    return _sagemaker_client
+def get_model_factory() -> ModelFactory:
+    """Get or create ModelFactory"""
+    global _model_factory
+    if _model_factory is None:
+        _model_factory = ModelFactory(region=settings.aws_region)
+    return _model_factory
+
+
+def get_opensearch_client() -> OpenSearchClient:
+    """Get or create OpenSearchClient"""
+    global _opensearch_client
+    if _opensearch_client is None:
+        _opensearch_client = OpenSearchClient(
+            host=settings.opensearch_host,
+            region=settings.opensearch_region,
+            index_name=settings.opensearch_index,
+            embedding_dimension=settings.embedding_dimension
+        )
+    return _opensearch_client
 
 
 def get_document_processor() -> DocumentProcessor:
-    """Get document processor instance"""
+    """Get document processor"""
     return DocumentProcessor(
         raw_docs_path=settings.raw_docs_path,
         processed_docs_path=settings.processed_docs_path
@@ -71,14 +77,11 @@ def get_document_processor() -> DocumentProcessor:
 
 
 def get_chunking_pipeline() -> ChunkingPipeline:
-    """Get chunking pipeline instance"""
+    """Get chunking pipeline"""
+    factory = get_model_factory()
     return ChunkingPipeline(
-        opensearch_host=settings.opensearch_host,
-        opensearch_region=settings.opensearch_region,
-        index_name=settings.opensearch_index,
-        embedding_endpoint=settings.embedding_endpoint,
-        sagemaker_client=get_sagemaker_client(),
-        embedding_dimension=settings.embedding_dimension,
+        embedding_model=factory.create_embedding_model(settings.embedding_endpoint),
+        opensearch_client=get_opensearch_client(),
         breakpoint_threshold=settings.chunking_breakpoint_threshold,
         min_chunk_size=settings.chunking_min_size,
         max_chunk_size=settings.chunking_max_size
@@ -89,15 +92,15 @@ def get_retrieval_service() -> RetrievalService:
     """Get or create retrieval service (singleton for session persistence)"""
     global _retrieval_service
     if _retrieval_service is None:
+        factory = get_model_factory()
         _retrieval_service = RetrievalService(
-            opensearch_host=settings.opensearch_host,
-            opensearch_region=settings.opensearch_region,
-            index_name=settings.opensearch_index,
-            embedding_endpoint=settings.embedding_endpoint,
-            llm_endpoint=settings.llm_endpoint,
-            sagemaker_client=get_sagemaker_client(),
-            llm_max_tokens=settings.llm_max_tokens,
-            llm_temperature=settings.llm_temperature
+            embedding_model=factory.create_embedding_model(settings.embedding_endpoint),
+            llm_model=factory.create_llm_model(
+                endpoint_name=settings.llm_endpoint,
+                max_tokens=settings.llm_max_tokens,
+                temperature=settings.llm_temperature
+            ),
+            opensearch_client=get_opensearch_client()
         )
     return _retrieval_service
 
@@ -108,10 +111,9 @@ def get_retrieval_service() -> RetrievalService:
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Check system health including OpenSearch connection"""
+    """Check system health"""
     try:
-        retrieval = get_retrieval_service()
-        result = retrieval.health_check()
+        result = get_opensearch_client().health_check()
         return HealthResponse(**result)
     except Exception as e:
         return HealthResponse(status='unhealthy', error=str(e))
@@ -125,12 +127,8 @@ async def health_check():
 async def create_index(delete_if_exists: bool = False):
     """Create OpenSearch index"""
     try:
-        pipeline = get_chunking_pipeline()
-        result = pipeline.indexer.create_index(delete_if_exists=delete_if_exists)
-        return IndexCreateResponse(
-            success=True,
-            message=result.get('message', 'Index created')
-        )
+        result = get_opensearch_client().create_index(delete_if_exists=delete_if_exists)
+        return IndexCreateResponse(success=True, message=result.get('message', 'Index created'))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -139,12 +137,8 @@ async def create_index(delete_if_exists: bool = False):
 async def delete_index():
     """Delete OpenSearch index"""
     try:
-        pipeline = get_chunking_pipeline()
-        result = pipeline.indexer.delete_index()
-        return IndexCreateResponse(
-            success=True,
-            message=result.get('message', 'Index deleted')
-        )
+        result = get_opensearch_client().delete_index()
+        return IndexCreateResponse(success=True, message=result.get('message', 'Index deleted'))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -153,10 +147,10 @@ async def delete_index():
 async def get_index_stats():
     """Get index statistics"""
     try:
-        pipeline = get_chunking_pipeline()
-        health = pipeline.health_check()
+        client = get_opensearch_client()
+        health = client.health_check()
         return IndexStatsResponse(
-            index_name=settings.opensearch_index,
+            index_name=client.index_name,
             document_count=health.get('document_count', 0),
             status=health.get('status', 'unknown')
         )
@@ -170,12 +164,11 @@ async def get_index_stats():
 
 @router.post("/documents/process", response_model=ProcessDocumentsResponse)
 async def process_documents(request: ProcessDocumentsRequest):
-    """Process DOCX documents and extract text/tables"""
+    """Process DOCX documents"""
     try:
         processor = get_document_processor()
         documents_metadata = [doc.model_dump() for doc in request.documents]
         processed = processor.process_all(documents_metadata)
-        
         return ProcessDocumentsResponse(
             success=True,
             documents_processed=len(processed),
@@ -187,21 +180,15 @@ async def process_documents(request: ProcessDocumentsRequest):
 
 @router.post("/documents/index", response_model=ChunkAndIndexResponse)
 async def chunk_and_index_documents(request: ChunkAndIndexRequest):
-    """
-    Process documents, chunk them, and index to OpenSearch.
-    
-    This is the main endpoint for ingesting new documents.
-    """
+    """Process, chunk, and index documents to OpenSearch"""
     try:
         processor = get_document_processor()
         pipeline = get_chunking_pipeline()
         
-        # Process documents if metadata provided
         if request.documents:
             documents_metadata = [doc.model_dump() for doc in request.documents]
             processed_docs = processor.process_all(documents_metadata)
         else:
-            # Load already processed documents
             processed_docs = processor.load_processed_documents()
         
         if not processed_docs:
@@ -213,7 +200,6 @@ async def chunk_and_index_documents(request: ChunkAndIndexRequest):
                 chunks_indexed=0
             )
         
-        # Chunk and index
         result = pipeline.process_and_index(
             processed_documents=processed_docs,
             create_new_index=request.create_new_index
@@ -231,7 +217,7 @@ async def chunk_and_index_documents(request: ChunkAndIndexRequest):
 
 
 # =============================================================================
-# SEARCH (Vector search only, no LLM)
+# SEARCH
 # =============================================================================
 
 @router.post("/search", response_model=SearchResponse)
@@ -256,8 +242,8 @@ async def search(request: SearchRequest):
                 chunk_id=r.get('chunk_id', ''),
                 chunk_index=r['chunk_index'],
                 entitlement=r['entitlement'],
-                orgId=r.get('orgId', ''),
-                tags=r.get('metadata', {}).get('tags', []),
+                orgId=r.get('org_id', ''),
+                tags=r.get('tags', []),
                 summary=r.get('summary', ''),
                 score=r['score']
             ) for r in results],
@@ -277,7 +263,6 @@ async def query(request: QueryRequest):
     try:
         retrieval = get_retrieval_service()
         
-        # Convert conversation history if provided
         history = None
         if request.conversation_history:
             history = [turn.model_dump() for turn in request.conversation_history]
@@ -295,9 +280,7 @@ async def query(request: QueryRequest):
         if result.get('source_document'):
             source_doc = SourceDocument(**result['source_document'])
         
-        sources = []
-        if result.get('sources'):
-            sources = [SourceDocument(**s) for s in result['sources']]
+        sources = [SourceDocument(**s) for s in result.get('sources', [])]
         
         return QueryResponse(
             answer=result['answer'],
@@ -323,7 +306,6 @@ async def create_session(request: SessionCreateRequest):
             entitlement=request.entitlement,
             org_id=request.org_id
         )
-        
         return SessionCreateResponse(
             session_id=session_id,
             user_id=request.user_id,
@@ -351,9 +333,7 @@ async def query_with_session(session_id: str, request: SessionQueryRequest):
         if result.get('source_document'):
             source_doc = SourceDocument(**result['source_document'])
         
-        sources = []
-        if result.get('sources'):
-            sources = [SourceDocument(**s) for s in result['sources']]
+        sources = [SourceDocument(**s) for s in result.get('sources', [])]
         
         return QueryResponse(
             answer=result['answer'],
@@ -369,7 +349,7 @@ async def query_with_session(session_id: str, request: SessionQueryRequest):
 
 @router.get("/sessions/{session_id}/history")
 async def get_session_history(session_id: str, limit: Optional[int] = None):
-    """Get conversation history for a session"""
+    """Get conversation history"""
     try:
         retrieval = get_retrieval_service()
         session = retrieval.get_session(session_id)
