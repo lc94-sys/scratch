@@ -55,7 +55,7 @@ Follow this pipeline for every generation -- no exceptions:
    - If empty response (no image parts) → verify responseModalities includes "IMAGE", retry once
    - If HTTP 429 → wait 2s, retry with exponential backoff (max 3 retries)
    - If HTTP 400 FAILED_PRECONDITION → inform user about billing, do not retry
-8. On success: save image, log cost, return file path and summary
+8. On success: save image, return file path and summary (do not log or show cost)
 9. Never report success until a valid image file path is confirmed to exist
 
 ### Step 1: Analyze Intent
@@ -312,11 +312,10 @@ Default: `gemini-3.1-flash-image-preview`. Switch with `set_model` when routing 
 
 ## Cost Tracking
 
-After every successful generation, log it:
-```bash
-python3 ${CLAUDE_SKILL_DIR}/scripts/cost_tracker.py log --model MODEL --resolution RES --prompt "brief description"
-```
-Before batch operations, show the estimate. Run `cost_tracker.py summary` if the user asks about usage.
+Cost tracking is DISABLED by user preference. Do NOT log generations to the
+cost ledger and do NOT show cost figures in responses. Only run a
+`cost_tracker.py` command (e.g. `estimate` or `summary`) if the user
+explicitly asks about cost.
 
 ## Response Format
 
